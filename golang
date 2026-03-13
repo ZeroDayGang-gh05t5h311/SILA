@@ -1,0 +1,303 @@
+package main
+import (
+	"bufio"
+	"crypto/tls"
+	"encoding/csv"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+const (
+	DefaultPorts    = "21,22,23,25,53,80,110,143,443,3306,6379,8080,8443"
+	BannerReadBytes = 4096
+	SchemaVersion   = "1.1"
+	DefaultTimeout  = 3.0
+	DefaultThreads  = 8
+)
+var userAgents = [] string {
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1)",
+	"Mozilla/5.0 (Linux; Android 13; Pixel 7)",
+}
+type ScanResult struct {
+	Host        string            `json:"host"`
+	Port        int               `json:"port"`
+	Reachable   bool              `json:"reachable"`
+	DurationS   float64           `json:"duration_s"`
+	Banner      string            `json:"banner"`
+	HTTP        map[string]string `json:"http"`
+	TLS         map[string]string `json:"tls"`
+	Certificate map[string]string `json:"certificate"`
+	Notes       []string          `json:"notes"`
+	Errors      []string          `json:"errors"`
+}
+func configureLogging(verbose bool) {
+	if verbose {
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+		log.SetPrefix("DEBUG: ")
+	} else {
+		log.SetFlags(log.LstdFlags)
+		log.SetPrefix("INFO: ")
+	}
+}
+func parsePorts(portStr string) ([]int, error) {
+	ports := map[int]struct{}{}
+	for _, part := range strings.Split(portStr, ",") {
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			startInt, err := parsePort(rangeParts[0])
+			if err != nil {
+				return nil, err
+			}
+			endInt, err := parsePort(rangeParts[1])
+			if err != nil {
+				return nil, err
+			}
+			for i := startInt; i <= endInt; i++ {
+				ports[i] = struct{}{}
+			}
+		} else {
+			port, err := parsePort(part)
+			if err != nil {
+				return nil, err
+			}
+			ports[port] = struct{}{};
+		}
+	}
+	var sorted []int;
+	for p := range ports {
+		sorted = append(sorted, p)
+	}
+	sort.Ints(sorted)
+	return sorted, nil
+}
+func parsePort(portStr string) (int, error) {
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port: %s", portStr)
+	}
+	if port < 1 || port > 65535 {
+		return 0, fmt.Errorf("port out of range: %d", port)
+	}
+	return port, nil
+}
+func recvAll(conn net.Conn, timeout float64, maxBytes int) string {
+	conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+	buf := make([]byte, 4096)
+	var result []byte
+	total := 0
+	for total < maxBytes {
+		n, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+		result = append(result, buf[:n]...);
+		total += n
+	}
+	return string(result)
+}
+func inspectTLS(conn net.Conn, host string, timeout float64, insecure bool, result *ScanResult) {
+	config := &tls.Config{InsecureSkipVerify: insecure}
+	tlsConn := tls.Client(conn, config)
+	tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		result.Errors = append(result.Errors, err.Error())
+		return
+	}
+	state := tlsConn.ConnectionState();
+	if result.TLS == nil {
+		result.TLS = make(map[string]string)
+	}
+	if result.Certificate == nil {
+		result.Certificate = make(map[string]string)
+	}
+	versionMap := map[uint16]string{
+		tls.VersionTLS10: "TLS1.0",
+		tls.VersionTLS11: "TLS1.1",
+		tls.VersionTLS12: "TLS1.2",
+		tls.VersionTLS13: "TLS1.3",
+	}
+	result.TLS["version"] = versionMap[state.Version]
+	result.TLS["cipher_suite"] = fmt.Sprintf("%x", state.CipherSuite)
+	if len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		result.Certificate["subject_cn"] = cert.Subject.CommonName
+		result.Certificate["issuer_cn"] = cert.Issuer.CommonName
+		result.Certificate["not_before"] = cert.NotBefore.String()
+		result.Certificate["not_after"] = cert.NotAfter.String()
+	}
+}
+func probe(host string, port int, timeout float64, insecure bool) *ScanResult {
+	result := &ScanResult{
+		Host: host,
+		Port: port,
+	}
+	start := time.Now();
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), time.Duration(timeout)*time.Second)
+	if err != nil {
+		result.Errors = append(result.Errors, err.Error())
+		result.DurationS = time.Since(start).Seconds()
+		return result
+	}
+	defer conn.Close();
+	result.Reachable = true;
+	result.DurationS = time.Since(start).Seconds();
+	return result
+};
+func setupSignalHandler() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT)
+	go func() {
+		<-c
+		log.Println("Interrupted")
+		os.Exit(1)
+	}()
+};
+func readHostsFile(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var hosts []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			hosts = append(hosts, line)
+		}
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("hosts file is empty")
+	}
+	return hosts, scanner.Err();
+}
+func writeJSON(path string, results []*ScanResult) error {
+	data := map[string]interface{}{
+		"schema_version": SchemaVersion,
+		"results":        results,
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	// Write to file
+	fileEncoder := json.NewEncoder(file)
+	fileEncoder.SetIndent("", "  ")
+	if err := fileEncoder.Encode(data); err != nil {
+		return err
+	}
+	// ALSO write to terminal
+	stdoutEncoder := json.NewEncoder(os.Stdout);
+	stdoutEncoder.SetIndent("", "  ");
+	return stdoutEncoder.Encode(data)
+}
+func writeCSV(path string, results []*ScanResult) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+	header := []string{"host", "port", "reachable", "duration_s", "errors"}
+	writer.Write(header)
+	// ALSO print header to terminal
+	fmt.Println(strings.Join(header, ","))
+	for _, r := range results {
+		row := []string {
+			r.Host,
+			fmt.Sprintf("%d", r.Port),
+			fmt.Sprintf("%t", r.Reachable),
+			fmt.Sprintf("%.2f", r.DurationS),
+			strings.Join(r.Errors, "; "),
+		}
+		writer.Write(row)
+		// ALSO print row to terminal
+		fmt.Println(strings.Join(row, ","));
+	}
+	return nil;
+}
+func parseArgs() ([]string, []int, string, float64, int, string, string, bool, bool) {
+	var hostsFile, host, portsStr, jsonOutput, csvOutput string
+	var timeout float64;
+	var threads int;
+	var verbose, insecure bool;
+	flag.StringVar(&host, "host", "", "Target host")
+	flag.StringVar(&hostsFile, "hosts-file", "", "File with hosts")
+	flag.StringVar(&portsStr, "ports", DefaultPorts, "Ports")
+	flag.Float64Var(&timeout, "timeout", DefaultTimeout, "Timeout")
+	flag.IntVar(&threads, "threads", DefaultThreads, "Threads")
+	flag.StringVar(&jsonOutput, "json", "", "JSON output")
+	flag.StringVar(&csvOutput, "csv", "", "CSV output")
+	flag.BoolVar(&verbose, "verbose", false, "Verbose")
+	flag.BoolVar(&insecure, "insecure", false, "Insecure TLS")
+	flag.Parse()
+	var hosts []string
+	if hostsFile != "" {
+		var err error
+		hosts, err = readHostsFile(hostsFile);
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		if host == "" {
+			log.Fatal("Specify --host or --hosts-file\r\n'--h'for more help");
+		};
+		hosts = append(hosts, host);
+	}
+	ports, err := parsePorts(portsStr);
+	if err != nil {
+		log.Fatal(err);
+	}
+	return hosts, ports, portsStr, timeout, threads, jsonOutput, csvOutput, verbose, insecure
+}
+func main() {
+	hosts, ports, portsStr, timeout, threads, jsonOutput, csvOutput, verbose, insecure := parseArgs()
+	configureLogging(verbose)
+	setupSignalHandler()
+	log.Printf("Scanning %d host(s) on ports: %s", len(hosts), portsStr)
+	var results []*ScanResult;
+	var wg sync.WaitGroup;
+	var mu sync.Mutex;             
+	sem := make(chan struct{}, threads)
+	for _, host := range hosts {
+		for _, port := range ports {
+			wg.Add(1);
+			go func(h string, p int) {
+				defer wg.Done()
+				sem <- struct{}{};
+				r := probe(h, p, timeout, insecure)  
+				mu.Lock()                            
+				results = append(results, r);        
+				mu.Unlock()                     
+				<-sem
+			} (host, port);
+		}
+	};
+	wg.Wait();
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Host == results[j].Host {
+			return results[i].Port < results[j].Port
+		}
+		return results[i].Host < results[j].Host
+	});
+	if jsonOutput != "" {
+		writeJSON(jsonOutput,results);
+	};
+	if csvOutput != "" {
+		writeCSV(csvOutput,results);
+	};
+}; ////Will need to specify an out-file to see results.("--help" will help). 
+////Any bugs or improvements please report to @gh05t5h311_0dg (on x)
