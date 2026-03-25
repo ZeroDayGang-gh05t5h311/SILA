@@ -19,12 +19,12 @@ import (
 )
 const (
 	DefaultPorts    = "21,22,23,25,53,80,110,143,443,3306,3309,6379,8080,8443,5432,6379,27017,5984,2222,5000,9000,10000,25565"
-	BannerReadBytes = 4096
 	SchemaVersion   = "1.1"
 	DefaultTimeout  = 3.0
 	DefaultThreads  = 8
+	BannerReadBytes = 4096
 )
-var userAgents = [] string {
+var userAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1)",
 	"Mozilla/5.0 (Linux; Android 13; Pixel 7)",
@@ -50,6 +50,30 @@ func configureLogging(verbose bool) {
 		log.SetPrefix("INFO: ")
 	}
 }
+func recvAll(conn net.Conn, timeout float64, maxBytes int) string {
+	conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+	const bufSize = 8192
+	buf := make([]byte, bufSize)
+	var result []byte
+	total := 0
+	for total < maxBytes {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			if total+n > maxBytes {
+				result = append(result, buf[:maxBytes-total]...)
+				total = maxBytes
+				break
+			} else {
+				result = append(result, buf[:n]...)
+				total += n
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return string(result)
+}
 func parsePorts(portStr string) ([]int, error) {
 	ports := map[int]struct{}{}
 	for _, part := range strings.Split(portStr, ",") {
@@ -63,6 +87,9 @@ func parsePorts(portStr string) ([]int, error) {
 			if err != nil {
 				return nil, err
 			}
+			if startInt > endInt {
+				startInt, endInt = endInt, startInt
+			}
 			for i := startInt; i <= endInt; i++ {
 				ports[i] = struct{}{}
 			}
@@ -71,16 +98,17 @@ func parsePorts(portStr string) ([]int, error) {
 			if err != nil {
 				return nil, err
 			}
-			ports[port] = struct{}{};
+			ports[port] = struct{}{}
 		}
 	}
-	var sorted []int;
+	var sorted []int
 	for p := range ports {
 		sorted = append(sorted, p)
 	}
 	sort.Ints(sorted)
 	return sorted, nil
 }
+
 func parsePort(portStr string) (int, error) {
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
@@ -91,30 +119,15 @@ func parsePort(portStr string) (int, error) {
 	}
 	return port, nil
 }
-func recvAll(conn net.Conn, timeout float64, maxBytes int) string {
-	conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-	buf := make([]byte, 4096)
-	var result []byte
-	total := 0
-	for total < maxBytes {
-		n, err := conn.Read(buf)
-		if err != nil {
-			break
-		}
-		result = append(result, buf[:n]...);
-		total += n
-	}
-	return string(result)
-}
 func inspectTLS(conn net.Conn, host string, timeout float64, insecure bool, result *ScanResult) {
-	config := &tls.Config{InsecureSkipVerify: insecure}
+	config := &tls.Config{InsecureSkipVerify: insecure, ServerName: host}
 	tlsConn := tls.Client(conn, config)
 	tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
-		result.Errors = append(result.Errors, err.Error())
+		result.Errors = append(result.Errors, fmt.Sprintf("TLS handshake failed: %s", err))
 		return
 	}
-	state := tlsConn.ConnectionState();
+	state := tlsConn.ConnectionState()
 	if result.TLS == nil {
 		result.TLS = make(map[string]string)
 	}
@@ -135,40 +148,114 @@ func inspectTLS(conn net.Conn, host string, timeout float64, insecure bool, resu
 		result.Certificate["issuer_cn"] = cert.Issuer.CommonName
 		result.Certificate["not_before"] = cert.NotBefore.String()
 		result.Certificate["not_after"] = cert.NotAfter.String()
+		now := time.Now()
+		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+			result.Certificate["cert_expired"] = "true"
+		} else {
+			result.Certificate["cert_expired"] = "false"
+		}
+		if cert.Subject.CommonName == cert.Issuer.CommonName {
+			result.Certificate["cert_self_signed"] = "true"
+		} else {
+			result.Certificate["cert_self_signed"] = "false"
+		}
 	}
 }
 func probe(host string, port int, timeout float64, insecure bool) *ScanResult {
 	result := &ScanResult{
 		Host: host,
 		Port: port,
+		HTTP: make(map[string]string),
+		TLS:  make(map[string]string),
+		Notes: []string{},
 	}
-	start := time.Now();
+	start := time.Now()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), time.Duration(timeout)*time.Second)
 	if err != nil {
 		result.Errors = append(result.Errors, err.Error())
 		result.DurationS = time.Since(start).Seconds()
 		return result
 	}
-	defer conn.Close();
-	result.Reachable = true;
-	result.DurationS = time.Since(start).Seconds();
+	defer conn.Close()
+	result.Reachable = true
+	result.DurationS = time.Since(start).Seconds()
+	result.Banner = strings.TrimSpace(recvAll(conn, timeout, BannerReadBytes))
+	switch port {
+	case 21: // FTP
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "FTP server detected")
+		}
+	case 22: // SSH
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "SSH server detected")
+		}
+	case 25: // SMTP
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "SMTP server detected")
+		}
+	case 3306: // MySQL
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "MySQL server detected")
+		}
+	case 5432: // PostgreSQL
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "PostgreSQL server detected")
+		}
+	case 6379: // Redis
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "Redis server detected")
+		}
+	case 27017: // MongoDB
+		if result.Banner != "" {
+			result.Notes = append(result.Notes, "MongoDB server detected")
+		}
+	}
+	if port == 80 || port == 8080 || port == 443 || port == 8443 {
+		request := fmt.Sprintf("GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: %s\r\n\r\n", host, userAgents[0])
+		conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+		if _, err := conn.Write([]byte(request)); err == nil {
+			resp := recvAll(conn, timeout, BannerReadBytes)
+			lines := strings.Split(resp, "\r\n")
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "HTTP/") {
+				result.HTTP["status_line"] = lines[0]
+				for _, line := range lines[1:] {
+					if line == "" {
+						break
+					}
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						result.HTTP[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+					}
+				}
+				result.Notes = append(result.Notes, "HTTP server detected")
+			}
+		} else {
+			result.Notes = append(result.Notes, fmt.Sprintf("HTTP request failed: %s", err))
+		}
+	}
+	if port == 443 || port == 8443 {
+		inspectTLS(conn, host, timeout, insecure, result)
+		result.Notes = append(result.Notes, "TLS inspected")
+	}
+
 	return result
-};
+}
 func setupSignalHandler() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT)
 	go func() {
 		<-c
-		log.Println("Interrupted")
+		log.Println("Interrupted by user")
 		os.Exit(1)
 	}()
-};
+}
 func readHostsFile(path string) ([]string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+
 	var hosts []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -180,7 +267,61 @@ func readHostsFile(path string) ([]string, error) {
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("hosts file is empty")
 	}
-	return hosts, scanner.Err();
+	return hosts, scanner.Err()
+}
+type Config struct {
+	Hosts    []string
+	Ports    []int
+	Timeout  float64
+	Threads  int
+	JSONOut  string
+	CSVOut   string
+	Verbose  bool
+	Insecure bool
+	PortsStr string
+}
+func parseArgs() *Config {
+	var hostsFile, host, portsStr, jsonOutput, csvOutput string
+	var timeout float64
+	var threads int
+	var verbose, insecure bool
+	flag.StringVar(&host, "host", "", "Target host")
+	flag.StringVar(&hostsFile, "hosts-file", "", "File with hosts")
+	flag.StringVar(&portsStr, "ports", DefaultPorts, "Ports")
+	flag.Float64Var(&timeout, "timeout", DefaultTimeout, "Timeout in seconds")
+	flag.IntVar(&threads, "threads", DefaultThreads, "Number of threads")
+	flag.StringVar(&jsonOutput, "json", "", "JSON output file")
+	flag.StringVar(&csvOutput, "csv", "", "CSV output file")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
+	flag.BoolVar(&insecure, "insecure", false, "Skip TLS verification")
+	flag.Parse()
+	var hosts []string
+	if hostsFile != "" {
+		var err error
+		hosts, err = readHostsFile(hostsFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else if host != "" {
+		hosts = append(hosts, host)
+	} else {
+		log.Fatal("Specify --host or --hosts-file")
+	}
+	ports, err := parsePorts(portsStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &Config{
+		Hosts:    hosts,
+		Ports:    ports,
+		Timeout:  timeout,
+		Threads:  threads,
+		JSONOut:  jsonOutput,
+		CSVOut:   csvOutput,
+		Verbose:  verbose,
+		Insecure: insecure,
+		PortsStr: portsStr,
+	}
 }
 func writeJSON(path string, results []*ScanResult) error {
 	data := map[string]interface{}{
@@ -192,15 +333,13 @@ func writeJSON(path string, results []*ScanResult) error {
 		return err
 	}
 	defer file.Close()
-	// Write to file
-	fileEncoder := json.NewEncoder(file)
-	fileEncoder.SetIndent("", "  ")
-	if err := fileEncoder.Encode(data); err != nil {
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(data); err != nil {
 		return err
 	}
-	// ALSO write to terminal
-	stdoutEncoder := json.NewEncoder(os.Stdout);
-	stdoutEncoder.SetIndent("", "  ");
+	stdoutEncoder := json.NewEncoder(os.Stdout)
+	stdoutEncoder.SetIndent("", "  ")
 	return stdoutEncoder.Encode(data)
 }
 func writeCSV(path string, results []*ScanResult) error {
@@ -209,95 +348,72 @@ func writeCSV(path string, results []*ScanResult) error {
 		return err
 	}
 	defer file.Close()
+
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	header := []string{"host", "port", "reachable", "duration_s", "errors"}
+
+	header := []string{"host", "port", "reachable", "duration_s", "banner", "notes", "cert_expired", "cert_self_signed", "errors"}
 	writer.Write(header)
-	// ALSO print header to terminal
-	fmt.Println(strings.Join(header, ","))
+	fmt.Println(strings.Join(header, ",")) // terminal output
 	for _, r := range results {
-		row := []string {
+		certExpired := ""
+		certSelfSigned := ""
+		if r.Certificate != nil {
+			certExpired = r.Certificate["cert_expired"]
+			certSelfSigned = r.Certificate["cert_self_signed"]
+		}
+		notes := strings.Join(r.Notes, "; ")
+		row := []string{
 			r.Host,
 			fmt.Sprintf("%d", r.Port),
 			fmt.Sprintf("%t", r.Reachable),
 			fmt.Sprintf("%.2f", r.DurationS),
+			strings.ReplaceAll(r.Banner, "\n", " "),
+			notes,
+			certExpired,
+			certSelfSigned,
 			strings.Join(r.Errors, "; "),
 		}
 		writer.Write(row)
-		// ALSO print row to terminal
-		fmt.Println(strings.Join(row, ","));
+		fmt.Println(strings.Join(row, ",")) // also terminal
 	}
-	return nil;
+	return nil
 }
-func parseArgs() ([]string, []int, string, float64, int, string, string, bool, bool) {
-	var hostsFile, host, portsStr, jsonOutput, csvOutput string
-	var timeout float64;
-	var threads int;
-	var verbose, insecure bool;
-	flag.StringVar(&host, "host", "", "Target host")
-	flag.StringVar(&hostsFile, "hosts-file", "", "File with hosts")
-	flag.StringVar(&portsStr, "ports", DefaultPorts, "Ports")
-	flag.Float64Var(&timeout, "timeout", DefaultTimeout, "Timeout")
-	flag.IntVar(&threads, "threads", DefaultThreads, "Threads")
-	flag.StringVar(&jsonOutput, "json", "", "JSON output")
-	flag.StringVar(&csvOutput, "csv", "", "CSV output")
-	flag.BoolVar(&verbose, "verbose", false, "Verbose")
-	flag.BoolVar(&insecure, "insecure", false, "Insecure TLS")
-	flag.Parse()
-	var hosts []string
-	if hostsFile != "" {
-		var err error
-		hosts, err = readHostsFile(hostsFile);
-		if err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		if host == "" {
-			log.Fatal("Specify --host or --hosts-file\r\n'--h'for more help");
-		};
-		hosts = append(hosts, host);
-	}
-	ports, err := parsePorts(portsStr);
-	if err != nil {
-		log.Fatal(err);
-	}
-	return hosts, ports, portsStr, timeout, threads, jsonOutput, csvOutput, verbose, insecure
-}
+
 func main() {
-	hosts, ports, portsStr, timeout, threads, jsonOutput, csvOutput, verbose, insecure := parseArgs()
-	configureLogging(verbose)
+	config := parseArgs()
+	configureLogging(config.Verbose)
 	setupSignalHandler()
-	log.Printf("Scanning %d host(s) on ports: %s", len(hosts), portsStr)
-	var results []*ScanResult;
-	var wg sync.WaitGroup;
-	var mu sync.Mutex;             
-	sem := make(chan struct{}, threads)
-	for _, host := range hosts {
-		for _, port := range ports {
-			wg.Add(1);
+	log.Printf("Scanning %d host(s) on ports: %s", len(config.Hosts), config.PortsStr)
+	var results []*ScanResult
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, config.Threads)
+	for _, host := range config.Hosts {
+		for _, port := range config.Ports {
+			wg.Add(1)
 			go func(h string, p int) {
 				defer wg.Done()
-				sem <- struct{}{};
-				r := probe(h, p, timeout, insecure)  
-				mu.Lock()                            
-				results = append(results, r);        
-				mu.Unlock()                     
+				sem <- struct{}{}
+				r := probe(h, p, config.Timeout, config.Insecure)
+				mu.Lock()
+				results = append(results, r)
+				mu.Unlock()
 				<-sem
-			} (host, port);
+			}(host, port)
 		}
-	};
-	wg.Wait();
+	}
+	wg.Wait()
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Host == results[j].Host {
 			return results[i].Port < results[j].Port
 		}
 		return results[i].Host < results[j].Host
-	});
-	if jsonOutput != "" {
-		writeJSON(jsonOutput,results);
-	};
-	if csvOutput != "" {
-		writeCSV(csvOutput,results);
-	};
-}; ////Will need to specify an out-file to see results.("--help" will help). 
-////Any bugs or improvements please report to @gh05t5h311_0dg (on x)
+	})
+	if config.JSONOut != "" {
+		writeJSON(config.JSONOut, results)
+	}
+	if config.CSVOut != "" {
+		writeCSV(config.CSVOut, results)
+	}
+}
