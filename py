@@ -2,7 +2,7 @@
 import random, socket, ssl, argparse, logging, json, time, signal, sys, csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List,Dict
-DEFAULT_PORTS = "21,22,23,25,53,80,110,143,443,3306,6379,8080,8443"
+DEFAULT_PORTS = "21,22,23,25,53,80,110,143,443,3306,3309,6379,8080,8443,5432,6379,27017,5984,2222,5000,9000,10000,25565"
 BANNER_READ_BYTES = 4096
 SCHEMA_VERSION = "1.1"
 def configure_logging(verbose: bool):
