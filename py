@@ -1,318 +1,369 @@
 #!/usr/bin/python3
-import random, socket, ssl, argparse, logging, json, time, signal, sys, csv
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List,Dict
+import asyncio,re,ssl,json,csv,time,signal,sys,argparse
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict
+from datetime import datetime
 DEFAULT_PORTS = "21,22,23,25,53,80,110,143,443,3306,3309,6379,8080,8443,5432,6379,27017,5984,2222,5000,9000,10000,25565"
-BANNER_READ_BYTES = 4096
 SCHEMA_VERSION = "1.1"
-def configure_logging(verbose: bool):
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+DEFAULT_TIMEOUT = 3.0
+DEFAULT_THREADS = 8
+BANNER_READ_BYTES = 4096
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1)",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7)",
+]
+@dataclass
 class ScanResult:
-    __slots__ = (
-        "host", "port", "reachable", "duration_s", "banner",
-        "http", "tls", "certificate", "notes", "errors"
-    )
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.reachable = False
-        self.duration_s = 0.0
-        self.banner = ""
-        self.http: Dict[str, str] = {}
-        self.tls: Dict[str, str] = {}
-        self.certificate: Dict[str, str] = {}
-        self.notes: List[str] = []
-        self.errors: List[str] = []
-
-    def to_dict(self):
-        return {
-            "host": self.host,
-            "port": self.port,
-            "reachable": bool(self.reachable),
-            "duration_s": float(round(self.duration_s, 4)),
-            "banner": self.banner or "",
-            "http": self.http or {},
-            "tls": self.tls or {},
-            "certificate": self.certificate or {},
-            "notes": list(self.notes),
-            "errors": list(self.errors),
-        }
-
+    host: str
+    port: int
+    reachable: bool = False
+    duration_s: float = 0.0
+    banner: str = ""
+    http: Dict[str, str] = field(default_factory=dict)
+    tls: Dict[str, str] = field(default_factory=dict)
+    certificate: Dict[str, str] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+@dataclass
+class ScannerConfig:
+    hosts: List[str]
+    ports: List[int]
+    timeout: float
+    threads: int
+    json_out: str
+    csv_out: str
+    verbose: bool
+    insecure: bool
+    ports_str: str
+FINGERPRINT_DB = [
+    {
+        "service": "ssh",
+        "patterns": [r"^SSH-\d\.\d-(?P<version>[^\r\n]+)"],
+        "note": "SSH service detected"
+    },
+    {
+        "service": "ftp",
+        "patterns": [r"ftp", r"220.*ftp"],
+        "note": "FTP service detected"
+    },
+    {
+        "service": "smtp",
+        "patterns": [r"smtp", r"220.*mail"],
+        "note": "SMTP service detected"
+    },
+    {
+        "service": "http",
+        "patterns": [r"^HTTP/\d\.\d"],
+        "note": "HTTP service detected"
+    },
+    {
+        "service": "nginx",
+        "patterns": [r"server:\s*nginx/?(?P<version>[^\s]*)"],
+        "note": "Nginx detected"
+    },
+    {
+        "service": "apache",
+        "patterns": [r"server:\s*apache/?(?P<version>[^\s]*)"],
+        "note": "Apache detected"
+    },
+    {
+        "service": "mysql",
+        "patterns": [r"mysql", r"\x00\x00\x00\x0a(?P<version>[^\x00]+)"],
+        "note": "MySQL detected"
+    },
+    {
+        "service": "postgresql",
+        "patterns": [r"postgresql"],
+        "note": "PostgreSQL detected"
+    },
+    {
+        "service": "redis",
+        "patterns": [r"-ERR", r"\+PONG", r"redis"],
+        "note": "Redis detected"
+    },
+    {
+        "service": "mongodb",
+        "patterns": [r"mongodb"],
+        "note": "MongoDB detected"
+    },
+]
+def fingerprint_with_db(data: str, result: ScanResult):
+    text = data.lower()
+    for fp in FINGERPRINT_DB:
+        for pattern in fp["patterns"]:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                note = fp["note"]
+                if note not in result.notes:
+                    result.notes.append(note)
+                if "version" in match.groupdict():
+                    version = match.group("version")
+                    if version:
+                        result.notes.append(f"{fp['service']} version: {version.strip()}")
+                break
+async def recv_all(reader: asyncio.StreamReader, timeout: float, max_bytes: int) -> str:
+    data = b""
+    try:
+        while len(data) < max_bytes:
+            chunk = await asyncio.wait_for(reader.read(8192), timeout)
+            if not chunk:
+                break
+            data += chunk
+    except Exception:
+        pass
+    return data[:max_bytes].decode(errors="ignore")
 def parse_ports(port_str: str) -> List[int]:
     ports = set()
     for part in port_str.split(","):
         if "-" in part:
-            start_str, end_str = part.split("-", 1)
-            start = int(start_str)
-            end = int(end_str)
+            start, end = part.split("-")
+            start, end = int(start), int(end)
             if start > end:
-                raise ValueError(f"Invalid port range: {part}")
+                start, end = end, start
             ports.update(range(start, end + 1))
         else:
-            ports.add(int(part))
-    for p in ports:
-        if p < 1 or p > 65535:
-            raise ValueError(f"Invalid port: {p}")
+            p = int(part)
+            if not (1 <= p <= 65535):
+                raise ValueError(f"Invalid port: {p}")
+            ports.add(p)
     return sorted(ports)
-
-def recv_all(sock, timeout: float, max_bytes: int):
-    sock.settimeout(timeout)
-    chunks = []
-    total = 0
+def fingerprint_banner(banner: str, result: ScanResult):
+    b = banner.lower()
+    fingerprints = {
+        "ssh": "SSH service detected",
+        "ftp": "FTP service detected",
+        "smtp": "SMTP service detected",
+        "mysql": "MySQL service detected",
+        "postgres": "PostgreSQL service detected",
+        "redis": "Redis service detected",
+        "mongodb": "MongoDB service detected",
+        "http": "HTTP-like service detected",
+    }
+    for key, note in fingerprints.items():
+        if key in b:
+            result.notes.append(note)
+async def active_probe(reader, writer, port: int, result: ScanResult):
     try:
-        while total < max_bytes:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if b"\r\n\r\n" in b"".join(chunks):
-                break
-    except socket.timeout:
-        logging.warning("Socket read timed out.")
-    except Exception as e:
-        logging.error(f"Error receiving data: {e}")
-    return b"".join(chunks).decode(errors="ignore")
-
-def parse_http_response(data: str, result: ScanResult):
-    lines = data.split("\r\n")
-    if not lines:
-        return
-    status_line = lines[0]
-    result.http["status_line"] = status_line
-    parts = status_line.split(" ", 2)
-    if len(parts) >= 2:
-        result.http["status_code"] = parts[1]
-        if len(parts) == 3:
-            result.http["reason"] = parts[2]
-    for line in lines[1:]:
-        if not line:
-            break
-        if ":" in line:
-            k, v = line.split(":", 1)
-            result.http[k.lower()] = v.strip()
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:118.0) Gecko/20100101 Firefox/118.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.6 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/116.0.1938.69 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Safari/537.36 OPR/102.0.4880.77",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36",
-    "Mozilla/5.0 (Android 13; Mobile; rv:118.0) Gecko/118.0 Firefox/118.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Edg/116.0.1938.69 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36 OPR/102.0.4880.77"
-]
-def rdmUA():
-    return random.choice(user_agents)
-def starttls_upgrade(sock, host, timeout, insecure, result):
-    try:
-        inspect_tls(sock, host, timeout, insecure, result)
-        result.notes.append("STARTTLS successful")
-    except Exception as e:
-        result.errors.append(f"STARTTLS failed: {e}")
-
-def inspect_tls(sock, host: str, timeout: float, insecure: bool, result: ScanResult):
-    context = ssl.create_default_context()
-    if insecure:
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    with context.wrap_socket(sock, server_hostname=host) as tls_sock:
-        tls_sock.settimeout(timeout)
-        tls_sock.do_handshake()
-
-        result.tls["version"] = tls_sock.version()
-        cipher = tls_sock.cipher()
-        if cipher:
-            result.tls["cipher_suite"] = cipher[0]
-            result.tls["cipher_protocol"] = cipher[1]
-            result.tls["cipher_bits"] = str(cipher[2])
-
-        cert = tls_sock.getpeercert()
-        if cert:
-            subject = dict(x[0] for x in cert.get("subject", []))
-            issuer = dict(x[0] for x in cert.get("issuer", []))
-            result.certificate["subject_cn"] = subject.get("commonName", "")
-            result.certificate["issuer_cn"] = issuer.get("commonName", "")
-            result.certificate["not_before"] = cert.get("notBefore", "")
-            result.certificate["not_after"] = cert.get("notAfter", "")
-
-def probe(host: str, port: int, timeout: float, insecure: bool) -> ScanResult:
-    result = ScanResult(host, port)
-    start = time.time()
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        result.reachable = True
-    except Exception as e:
-        result.errors.append(str(e))
-        result.duration_s = time.time() - start
-        return result
-    try:
-        banner = recv_all(sock, timeout, BANNER_READ_BYTES)
-        result.banner = banner
-        if port == 25 and banner.startswith("220"):
-            sock.sendall(b"EHLO scanner\r\n")
-            if "STARTTLS" in recv_all(sock, timeout, BANNER_READ_BYTES).upper():
-                sock.sendall(b"STARTTLS\r\n")
-                recv_all(sock, timeout, BANNER_READ_BYTES)
-                starttls_upgrade(sock, host, timeout, insecure, result)
-        elif port == 110 and banner.startswith("+OK"):
-            sock.sendall(b"STLS\r\n")
-            if recv_all(sock, timeout, BANNER_READ_BYTES).startswith("+OK"):
-                starttls_upgrade(sock, host, timeout, insecure, result)
-        elif port == 143 and "IMAP" in banner.upper():
-            sock.sendall(b"a001 STARTTLS\r\n")
-            if "OK" in recv_all(sock, timeout, BANNER_READ_BYTES).upper():
-                starttls_upgrade(sock, host, timeout, insecure, result)
-        elif port in (443, 8443):
-            inspect_tls(sock, host, timeout, insecure, result)
-        elif port in (80, 8080):
-            sock.sendall(
-                f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {rdmUA()}\r\n\r\n".encode()
-            )
-            parse_http_response(recv_all(sock, timeout, BANNER_READ_BYTES), result)
-    except Exception as e:
-        result.errors.append(str(e))
-    finally:
+        if port == 6379:  # Redis
+            writer.write(b"PING\r\n")
+            await writer.drain()
+            resp = await reader.read(100)
+            if b"PONG" in resp:
+                result.notes.append("Redis confirmed via PING")
+        elif port == 25:
+            writer.write(b"EHLO test\r\n")
+            await writer.drain()
+            resp = await reader.read(200)
+            if b"SMTP" in resp:
+                result.notes.append("SMTP confirmed via EHLO")
+        elif port == 21:
+            writer.write(b"FEAT\r\n")
+            await writer.drain()
+            resp = await reader.read(200)
+            if b"211" in resp:
+                result.notes.append("FTP features detected")
+    except Exception:
+        pass
+class AsyncPortScanner:
+    def __init__(self, config: ScannerConfig):
+        self.config = config
+        self.semaphore = asyncio.Semaphore(config.threads)
+    async def inspect_tls(self, host: str, port: int, result: ScanResult):
         try:
-            sock.close()
-        except Exception:
-            pass
-    result.duration_s = time.time() - start
-    return result
-def setup_signal_handler():
-    def handler(sig, frame):
-        logging.warning("Interrupted. Exiting.")
-        sys.exit(1)
-    signal.signal(signal.SIGINT, handler)
-def read_hosts_file(path: str) -> List[str]:
-    hosts = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            hosts.append(line)
-    if not hosts:
-        raise ValueError("Hosts file is empty")
-    return hosts
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Threaded TCP banner and TLS metadata scanner"
-    )
-    parser.add_argument("host", nargs="?",
-                        help="Target host (ignored if --hosts-file is used)")
-    parser.add_argument("--hosts-file",
-                        help="File containing list of target hosts (one per line)")
-    parser.add_argument("--ports", default=DEFAULT_PORTS,
-                        help="Ports (e.g. 80,443 or 1-1024)")
-    parser.add_argument("--timeout", type=float, default=3.0)
-    parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--json", help="Write output to JSON file")
-    parser.add_argument("--csv", help="Write output to CSV file")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--insecure", action="store_true",
-                        help="Disable TLS certificate verification")
-    return parser.parse_args()
+            context = ssl.create_default_context()
+            if self.config.insecure:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=context, server_hostname=host),
+                timeout=self.config.timeout
+            )
+            ssl_obj = writer.get_extra_info("ssl_object")
+            if ssl_obj:
+                result.tls["version"] = ssl_obj.version()
+                result.tls["cipher"] = str(ssl_obj.cipher())
+                cert = ssl_obj.getpeercert()
+                if cert:
+                    subject = dict(x[0] for x in cert.get("subject", []))
+                    issuer = dict(x[0] for x in cert.get("issuer", []))
+                    result.certificate["subject_cn"] = subject.get("commonName", "")
+                    result.certificate["issuer_cn"] = issuer.get("commonName", "")
+                    result.certificate["not_before"] = cert.get("notBefore", "")
+                    result.certificate["not_after"] = cert.get("notAfter", "")
+                    try:
+                        not_before = datetime.strptime(cert["notBefore"], "%b %d %H:%M:%S %Y %Z")
+                        not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                        now = datetime.datetime.now(datetime.utc)
+                        result.certificate["cert_expired"] = str(now > not_after).lower()
+                        result.certificate["cert_not_yet_valid"] = str(now < not_before).lower()
+                        subject_cn = result.certificate.get("subject_cn", "")
+                        issuer_cn = result.certificate.get("issuer_cn", "")
+                        result.certificate["cert_self_signed"] = str(subject_cn == issuer_cn).lower()
+                        if result.certificate["cert_expired"] == "true":
+                            result.notes.append("Expired TLS certificate")
+                        if result.certificate["cert_self_signed"] == "true":
+                            result.notes.append("Self-signed certificate")
+
+                    except Exception:
+                        pass
+            writer.close()
+            await writer.wait_closed()
+        except Exception as e:
+            result.errors.append(f"TLS error: {e}")
+    async def probe(self, host: str, port: int) -> ScanResult:
+        async with self.semaphore:
+            result = ScanResult(host=host, port=port)
+            start = time.time()
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=self.config.timeout)
+                result.reachable = True
+                result.duration_s = time.time() - start
+                result.banner = (await recv_all(reader, self.config.timeout, BANNER_READ_BYTES)).strip()
+                fingerprint_with_db(result.banner, result)
+                service_map = {
+                    21: "FTP",
+                    22: "SSH",
+                    25: "SMTP",
+                    3306: "MySQL",
+                    5432: "PostgreSQL",
+                    6379: "Redis",
+                    27017: "MongoDB",
+                }
+                if port in service_map and result.banner:
+                    result.notes.append(f"{service_map[port]} server detected")
+                if port in (80, 8080, 443, 8443):
+                    request = f"GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: {USER_AGENTS[0]}\r\n\r\n"
+                    try:
+                        writer.write(request.encode())
+                        await writer.drain()
+                        resp = await recv_all(reader, self.config.timeout, BANNER_READ_BYTES)
+                        lines = resp.split("\r\n")
+                        if lines and lines[0].startswith("HTTP/"):
+                            result.http["status_line"] = lines[0]
+                            for line in lines[1:]:
+                                if not line:
+                                    break
+                                if ":" in line:
+                                    k, v = line.split(":", 1)
+                                    key = k.strip()
+                                    val = v.strip()
+                                    result.http[key] = val
+
+                                    lk = key.lower()
+                                    if lk == "server":
+                                        result.http["server"] = val
+                                    elif lk == "x-powered-by":
+                                        result.http["powered_by"] = val
+                                    elif lk == "content-type":
+                                        result.http["content_type"] = val
+                            if "server" in result.http:
+                                result.notes.append(f"Server: {result.http['server']}")
+                            if "powered_by" in result.http:
+                                result.notes.append(f"Powered by: {result.http['powered_by']}")
+                            if "application/json" in result.http.get("content_type", ""):
+                                result.notes.append("Possible API endpoint")
+                            if "location" in result.http:
+                                result.notes.append("Redirect detected")
+                            result.notes.append("HTTP server detected")
+                    except Exception as e:
+                        result.notes.append(f"HTTP request failed: {e}")
+                await active_probe(reader, writer, port, result)
+                writer.close()
+                await writer.wait_closed()
+                if port in (443, 8443):
+                    await self.inspect_tls(host, port, result)
+                    result.notes.append("TLS inspected")
+            except Exception as e:
+                result.errors.append(str(e))
+                result.duration_s = time.time() - start
+            return result
+    async def run(self) -> List[ScanResult]:
+        tasks = [
+            self.probe(host, port)
+            for host in self.config.hosts
+            for port in self.config.ports
+        ]
+        results = await asyncio.gather(*tasks)
+        results.sort(key=lambda r: (r.host, r.port))
+        return results
+def write_json(path: str, results: List[ScanResult]):
+    data = {
+        "schema_version": SCHEMA_VERSION,
+        "results": [asdict(r) for r in results],
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(json.dumps(data, indent=2))
 def write_csv(path: str, results: List[ScanResult]):
+    header = ["host", "port", "reachable", "duration_s", "banner", "notes", "cert_expired", "cert_self_signed", "errors"]
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "host",
-            "port",
-            "reachable",
-            "duration_s",
-            "banner",
-            "http_status",
-            "tls_version",
-            "tls_cipher",
-            "cert_subject_cn",
-            "cert_issuer_cn",
-            "cert_not_before",
-            "cert_not_after",
-            "errors",
-        ])
+        writer.writerow(header)
+        print(",".join(header))
         for r in results:
-            writer.writerow([
+            row = [
                 r.host,
                 r.port,
                 r.reachable,
                 f"{r.duration_s:.2f}",
-                r.banner.strip(),
-                r.http.get("status_code", ""),
-                r.tls.get("version", ""),
-                r.tls.get("cipher_suite", ""),
-                r.certificate.get("subject_cn", ""),
-                r.certificate.get("issuer_cn", ""),
-                r.certificate.get("not_before", ""),
-                r.certificate.get("not_after", ""),
+                r.banner.replace("\n", " "),
+                "; ".join(r.notes),
+                r.certificate.get("cert_expired", ""),
+                r.certificate.get("cert_self_signed", ""),
                 "; ".join(r.errors),
-            ])
-def main():
-    args = parse_args()
-    configure_logging(args.verbose)
-    setup_signal_handler()
-    try:
-        ports = parse_ports(args.ports)
-    except ValueError as e:
-        logging.error(str(e))
-        sys.exit(1)
+            ]
+            writer.writerow(row)
+            print(",".join(map(str, row)))
+def parse_args() -> ScannerConfig:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host")
+    parser.add_argument("--hosts-file")
+    parser.add_argument("--ports", default=DEFAULT_PORTS)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
+    parser.add_argument("--json")
+    parser.add_argument("--csv")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--insecure", action="store_true")
+    args = parser.parse_args()
     if args.hosts_file:
-        try:
-            hosts = read_hosts_file(args.hosts_file)
-        except Exception as e:
-            logging.error(str(e))
-            sys.exit(1)
-    else:
-        if not args.host:
-            logging.error("You must specify a host or --hosts-file")
-            sys.exit(1)
+        with open(args.hosts_file) as f:
+            hosts = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    elif args.host:
         hosts = [args.host]
-    logging.info(f"Scanning {len(hosts)} host(s) on {len(ports)} ports")
-    results = []
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = [
-            executor.submit(probe, host, port, args.timeout, args.insecure)
-            for host in hosts
-            for port in ports
-        ]
-        for f in as_completed(futures):
-            results.append(f.result())
-    results.sort(key=lambda r: (r.host, r.port))
-    for r in results:
-        if not r.reachable:
-            print(f"[{r.host}:{r.port}] unreachable")
-            continue
-        print(f"[{r.host}:{r.port}] reachable ({r.duration_s:.2f}s)")
-        if r.banner:
-            print(r.banner.strip())
-        if r.tls:
-            for k, v in r.tls.items():
-                print(f"  TLS {k}: {v}")
-        if r.certificate:
-            for k, v in r.certificate.items():
-                print(f"  Cert {k}: {v}")
-        if r.errors:
-            for e in r.errors:
-                print(f"  Error: {e}")
-        print()
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "results": [r.to_dict() for r in results],
-                },
-                f,
-                indent=2,
-            )
-        logging.info(f"Results written to {args.json}")
-    if args.csv:
-        write_csv(args.csv, results)
-        logging.info(f"Results written to {args.csv}")
+    else:
+        print("Specify --host or --hosts-file")
+        sys.exit(1)
+    ports = parse_ports(args.ports)
+    return ScannerConfig(
+        hosts=hosts,
+        ports=ports,
+        timeout=args.timeout,
+        threads=args.threads,
+        json_out=args.json,
+        csv_out=args.csv,
+        verbose=args.verbose,
+        insecure=args.insecure,
+        ports_str=args.ports,
+    )
+def setup_signal_handler():
+    def handler():
+        print("Interrupted by user")
+        sys.exit(1)
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGINT, handler)
+async def main():
+    config = parse_args()
+    setup_signal_handler()
+    print(f"Scanning {len(config.hosts)} host(s) on ports: {config.ports_str}")
+    scanner = AsyncPortScanner(config)
+    results = await scanner.run()
+    if config.json_out:
+        write_json(config.json_out, results)
+    if config.csv_out:
+        write_csv(config.csv_out, results)
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
